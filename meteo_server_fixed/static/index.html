@@ -24,13 +24,18 @@
       position: absolute; z-index: 1000; top: 10px; left: 10px;
       background: #fff; padding: 6px 8px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.08);
       font: 14px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      display: flex; gap: 8px; align-items: center;
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
     }
     .toolbar button, .toolbar select {
       border: 1px solid #ddd; background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer;
     }
     .toolbar button:hover { background: #f6f6f6; }
     .muted { color: #888; font-size: 12px; }
+    .badge { font-size: 12px; padding: 4px 6px; border-radius: 8px; border:1px solid #d7d7d7; background:#f3f3f3; }
+    .badge.ok { border-color:#cce5cc; background:#eaf6ea; color:#245b25; }
+    .badge.err { border-color:#f1c0c0; background:#fde9e9; color:#a61b1b; }
+
+    .status-strip { display:flex; gap:6px; align-items:center; }
 
     /* стили для попапа и графиков */
     .popup .head { margin-bottom: 6px; }
@@ -55,10 +60,21 @@
         <option value="metric" selected>Metric</option>
       </select>
     </label>
+    <label>Окно:
+      <select id="windowSel">
+        <option value="30">30 мин</option>
+        <option value="360" selected>6 часов</option>
+        <option value="1440">24 часа</option>
+      </select>
+    </label>
+    <div class="status-strip">
+      <span id="lastRefresh" class="badge">Обновление: —</span>
+      <span id="fetchErrors" class="badge" style="display:none;">Ошибки: 0</span>
+    </div>
     <span id="placeHint" class="muted" style="display:none;">кликни по карте, чтобы поставить станцию…</span>
   </div>
 
   <!-- наш клиентский код -->
-  <script src="/static/client.js?v=205"></script>
+  <script src="/static/client.js?v=208"></script>
 </body>
 </html>

@@ -19,6 +19,7 @@
     return await r.json();
   }
   const fmt = v => (v == null || Number.isNaN(v) ? "—" : (Math.abs(v) < 10 ? v.toFixed(2) : v.toFixed(1)));
+  const fmtTs = ts => ts ? new Date(ts * 1000).toLocaleString() : "—";
 
   // -------------------- series meta --------------------
   const COLORS = {
@@ -31,6 +32,15 @@
     Ra4:"Сумма (сутки)", Rs4:"Сумма (период)", Hc5:"Облачность (код)"
   };
   const UNITS = { Sa0:"м/с", Ta1:"°C", Hr1:"%", Pa2:"гПа", Or3:"", Rt4:"", Ri4:"", Ra4:"", Rs4:"", Hc5:"" };
+
+  const WINDOW_PRESETS = [
+    { value: 30, label: "30 мин" },
+    { value: 360, label: "6 часов" },
+    { value: 1440, label: "24 часа" },
+  ];
+
+  let currentWindowMinutes = WINDOW_PRESETS[1].value;
+  const refreshUI = { last: null, err: null };
 
   // краткие описания для подсказок (подкорректируем под твой протокол при необходимости)
   const SERIES_INFO = {
@@ -45,6 +55,13 @@
     Rs4: "Сумма осадков за период окна",
     Hc5: "Облачность: кол-во слоёв и их высоты"
   };
+
+  async function runInBatches(items, batchSize, worker){
+    for (let i = 0; i < items.length; i += batchSize){
+      const slice = items.slice(i, i + batchSize);
+      await Promise.allSettled(slice.map(worker));
+    }
+  }
 
   const STATUS_HINTS = {
     Er3:"Ошибки по блоку Hc5 (пример)",
@@ -66,6 +83,7 @@
     ctx.fillStyle = "#fff"; ctx.fillRect(0,0,cssW,cssH);
     ctx.strokeStyle = "#e6e6e6"; ctx.strokeRect(.5,.5,cssW-1,cssH-1);
 
+    canvas._spark = null;
     if (!ys?.length) { ctx.fillStyle="#888"; ctx.fillText("Нет данных", 10, cssH/2); return; }
     let min=Infinity,max=-Infinity;
     ys.forEach(v=>{ if(v!=null&&!Number.isNaN(v)){ if(v<min)min=v; if(v>max)max=v; }});
@@ -73,10 +91,12 @@
     if(min===max){ min-=1; max+=1; }
 
     const pad=10, W=cssW-pad*2, H=cssH-pad*2;
+    const coords = [];
     ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.beginPath();
     ys.forEach((v,i)=>{
       const x = pad + (i*W)/Math.max(1,ys.length-1);
       const y = pad + (1-(v-min)/(max-min))*H;
+      coords.push({ x, y, ts: ts?.[i], value: v });
       if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
     });
     ctx.stroke();
@@ -88,6 +108,53 @@
 
     ctx.fillStyle="#333"; ctx.font="12px system-ui, sans-serif";
     ctx.fillText(`${fmt(last)}${unit?` ${unit}`:""}`, Math.min(cssW-60,lx+6), Math.max(12, ly-6));
+
+    canvas._spark = { coords, color, unit };
+  }
+
+  const sparkTip = (() => {
+    const el = document.createElement("div");
+    el.style.position = "fixed";
+    el.style.pointerEvents = "none";
+    el.style.background = "rgba(0,0,0,.75)";
+    el.style.color = "#fff";
+    el.style.padding = "6px 8px";
+    el.style.borderRadius = "6px";
+    el.style.font = "12px system-ui, sans-serif";
+    el.style.zIndex = 2000;
+    el.style.display = "none";
+    document.body.appendChild(el);
+    return el;
+  })();
+
+  function showSparkTip(text, x, y) {
+    sparkTip.textContent = text;
+    sparkTip.style.display = "block";
+    sparkTip.style.left = `${x + 12}px`;
+    sparkTip.style.top = `${y + 12}px`;
+  }
+  function hideSparkTip() { sparkTip.style.display = "none"; }
+
+  function bindSparklineTooltip(canvas) {
+    const handler = (ev) => {
+      const data = canvas._spark;
+      if (!data || !data.coords?.length) { hideSparkTip(); return; }
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      let best = null;
+      for (const c of data.coords) {
+        const dx = c.x - x, dy = c.y - y;
+        const dist = dx*dx + dy*dy;
+        if (best === null || dist < best.dist) best = { dist, c };
+      }
+      if (!best || best.c.value == null || Number.isNaN(best.c.value)) { hideSparkTip(); return; }
+      const tsLabel = fmtTs(best.c.ts);
+      const valLabel = `${fmt(best.c.value)}${data.unit ? ` ${data.unit}` : ""}`;
+      showSparkTip(`${tsLabel}\n${valLabel}`, ev.clientX, ev.clientY);
+    };
+    canvas.addEventListener("mousemove", handler);
+    canvas.addEventListener("mouseleave", hideSparkTip);
   }
 
   async function renderSeriesBox(el, stationId, minutes, fields, units) {
@@ -119,7 +186,7 @@
       row.appendChild(title); row.appendChild(cv); el.appendChild(row);
 
       const unit = UNITS[f] || "";
-      requestAnimationFrame(()=> drawSparkline(cv, data.ts||[], data.series?.[f]||[], COLORS[f]||"#444", unit));
+      requestAnimationFrame(()=> { drawSparkline(cv, data.ts||[], data.series?.[f]||[], COLORS[f]||"#444", unit); bindSparklineTooltip(cv); });
     }
   }
 
@@ -171,7 +238,11 @@
 
       const combined = [timeBadge, badgesHtml, cloudHtml, cloudLegendHTML()].filter(Boolean).join(" ");
       el.innerHTML = combined || `<span style="opacity:.6">нет статусов</span>`;
-    }catch(e){ /* silent */ }
+    }catch(e){
+      console.error(e);
+      const el = document.getElementById(`status-badges-${stationId}`);
+      if (el) el.innerHTML = `<span class="series-error">Ошибка загрузки статусов</span>`;
+    }
   }
 
   // ---------- маркеры: подсветка по статусам ----------
@@ -211,8 +282,28 @@
     return `[${t}] ${pairs.join(", ")}${cloud}`;
   }
 
+  const windowOptionsHTML = (selValue) => WINDOW_PRESETS.map(p => `<option value="${p.value}" ${+selValue===p.value?"selected":""}>${p.label}</option>`).join("");
+
+  function updateFetchIndicators(okCount, errCount){
+    const total = okCount + errCount;
+    if (refreshUI.last && total >= 0){
+      refreshUI.last.textContent = `Обновление: ${new Date().toLocaleTimeString()}`;
+      refreshUI.last.classList.toggle("ok", errCount === 0);
+      refreshUI.last.classList.toggle("err", errCount > 0);
+    }
+    if (refreshUI.err){
+      if (errCount > 0){
+        refreshUI.err.style.display = "inline-block";
+        refreshUI.err.textContent = `Ошибки: ${errCount}`;
+        refreshUI.err.classList.add("err");
+      } else {
+        refreshUI.err.style.display = "none";
+      }
+    }
+  }
+
   // ---------- попап ----------
-  function popupHTML(st) {
+  function popupHTML(st, defaultWindow) {
     const id = st.id || st.code || "unknown";
     const seriesChecks = ["Sa0","Ta1","Hr1","Pa2","Or3","Rt4","Ri4","Ra4","Rs4","Hc5"].map(f=>{
       const title = SERIES_INFO[f] ? `${SERIES_INFO[f]}${UNITS[f] ? `, ед.: ${UNITS[f]}` : ""}` : f;
@@ -225,11 +316,9 @@
           Lat: ${(+st.lat).toFixed(6)}, Lon: ${(+st.lon).toFixed(6)}
         </div>
         <div class="controls">
-          Окно (мин):
+          Окно:
           <select class="win">
-            <option value="60">60</option>
-            <option value="120" selected>120</option>
-            <option value="180">180</option>
+            ${windowOptionsHTML(defaultWindow)}
           </select>
           &nbsp;&nbsp;Серии:
           ${seriesChecks}
@@ -244,8 +333,9 @@
     const winSel = $(".win", pEl);
     const chks = $all("input.f", pEl);
     const box = $(".series-box", pEl);
+    if (winSel) winSel.value = String(currentWindowMinutes);
     const rerender = () => {
-      const minutes = parseInt(winSel.value||"120",10);
+      const minutes = parseInt(winSel.value||currentWindowMinutes,10);
       const fields = chks.filter(c=>c.checked).map(c=>c.dataset.f);
       if (!fields.length) { box.innerHTML = `<div class="series-hint">Выберите хотя бы одну серию.</div>`; return; }
       renderSeriesBox(box, st.id||st.code, minutes, fields, "metric");
@@ -260,7 +350,7 @@
 
     // автообновление графиков каждые 10с пока открыт попап
     const _tick = () => {
-      const minutes = parseInt(winSel.value||"120",10);
+      const minutes = parseInt(winSel.value||currentWindowMinutes,10);
       const fields = chks.filter(c=>c.checked).map(c=>c.dataset.f);
       if (fields.length) renderSeriesBox(box, _sid, minutes, fields, "metric");
     };
@@ -272,6 +362,17 @@
 
   // -------------------- map init --------------------
   async function init() {
+    refreshUI.last = $("#lastRefresh");
+    refreshUI.err = $("#fetchErrors");
+    const windowSel = $("#windowSel");
+    if (windowSel) {
+      currentWindowMinutes = parseInt(windowSel.value || currentWindowMinutes, 10);
+      windowSel.addEventListener("change", () => {
+        currentWindowMinutes = parseInt(windowSel.value || currentWindowMinutes, 10);
+        $all(".win").forEach(sel => { sel.value = String(currentWindowMinutes); sel.dispatchEvent(new Event("change")); });
+      });
+    }
+
     const map = L.map("map").setView([59.9, 30.3], 11);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution:"&copy; OpenStreetMap contributors", maxZoom:19 }).addTo(map);
 
@@ -282,12 +383,15 @@
       const sid = st.id || st.code;
       const m = L.marker([st.lat, st.lon], { icon: makeIcon("green") }).addTo(map);
       markers.set(sid, { marker: m, st });
-      m.bindPopup(popupHTML(st), { maxWidth: 520 });
+      m.bindPopup(popupHTML(st, currentWindowMinutes), { maxWidth: 520 });
       m.on("popupopen", e => wirePopup(e.popup.getElement(), st));
     }
 
     async function refreshMarkerStatuses(){
-      for (const [sid, obj] of markers) {
+      let ok = 0, err = 0;
+      await runInBatches([...markers.keys()], 5, async (sid) => {
+        const obj = markers.get(sid);
+        if (!obj) return;
         try {
           const j = await getJSON(`/status/last?station_id=${encodeURIComponent(sid)}`);
           const sev = computeSeverity(j);
@@ -295,8 +399,13 @@
           const title = buildStatusTitle(j);
           const el = obj.marker.getElement();
           if (el) el.title = title;
-        } catch {}
-      }
+          ok++;
+        } catch (e) {
+          console.error(e);
+          err++;
+        }
+      });
+      updateFetchIndicators(ok, err);
     }
     await refreshMarkerStatuses();
     setInterval(refreshMarkerStatuses, 10000);
