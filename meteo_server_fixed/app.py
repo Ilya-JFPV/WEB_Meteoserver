@@ -547,7 +547,11 @@ LAST_RAW: Dict[str, Tuple[str, int]] = {}  # sid -> (raw, ts)
 
 
 @app.post("/ingest", response_model=IngestResult)
-async def ingest(req: Request, auth=Depends(require_api_key)):
+async def ingest(
+    req: Request,
+    store_dep: Store = Depends(get_store_dep),
+    auth=Depends(require_api_key),
+):
     started = time.perf_counter()
     sid: Optional[str] = None
     raw_bytes = await req.body()
@@ -584,7 +588,7 @@ async def ingest(req: Request, auth=Depends(require_api_key)):
 
         stored = 0
         for k, v in measures.items():
-            store.add_point(sid, k, v, ts)
+            store_dep.add_point(sid, k, v, ts)
             stored += 1
 
         INGEST_PACKETS_TOTAL.labels(transport="http").inc()
@@ -711,10 +715,12 @@ async def run_demo_telegram_alerts():
 
 # ---------- demo filler ----------
 @app.post("/demo/fill")
-async def demo_fill(auth=Depends(require_api_key)):
-    if not store.stations:
-        s = store.add_station(59.871644, 29.819128, "Station")
-        store.add_station(59.93, 30.31, "Station")
+async def demo_fill(
+    store_dep: Store = Depends(get_store_dep), auth=Depends(require_api_key)
+):
+    if not store_dep.stations:
+        s = store_dep.add_station(59.871644, 29.819128, "Station")
+        store_dep.add_station(59.93, 30.31, "Station")
         for k, v in {"Sa0": 3.5, "Ta1": 10.5, "Hr1": 29, "Pa2": 1002.8}.items():
             store_dep.add_point(s.id, k, v, _now_ts())
     return {"ok": True}
