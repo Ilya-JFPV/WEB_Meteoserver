@@ -1,17 +1,21 @@
 # app.py — Meteo Server (parametric, protocol 0.4.2) with persistence, status cache, TCP ingest
 # Encoding: UTF-8
 
+import asyncio
+import json
+import logging
+import logging.config
+import logging.handlers
 import os
 import re
-import json
 import time
-import asyncio
-from pathlib import Path
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +32,8 @@ TRIM_TO = int(os.getenv("TRIM_TO", "2000"))
 LOG_TO_FILE = bool(int(os.getenv("INGEST_LOG_TO_FILE", "1")))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_PATH = os.path.join(LOG_DIR, "ingest.log")
+APP_LOG_PATH = os.getenv("APP_LOG_PATH", os.path.join(LOG_DIR, "app.log"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # persistence
 PERSIST_STATIONS = int(os.getenv("PERSIST_STATIONS", "1"))
@@ -40,6 +46,93 @@ ENABLE_TCP = int(os.getenv("ENABLE_TCP", "1"))                    # 1 — run TC
 DEMO_TG = os.getenv("DEMO_TELEGRAM_ALERTS", "0") == "1"           # 1 — run demo Telegram alerts
 
 STARTED_AT = int(time.time())
+
+
+# -------------------------- logging setup --------------------------
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+            "station_id": getattr(record, "station_id", ""),
+            "metric_count": getattr(record, "metric_count", 0),
+            "error": getattr(record, "error", ""),
+            "raw": getattr(record, "raw", ""),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging():
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "json": {
+                "()": JsonFormatter,
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "json",
+                "level": LOG_LEVEL,
+            },
+            "app_file": {
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "formatter": "json",
+                "level": LOG_LEVEL,
+                "filename": APP_LOG_PATH,
+                "when": "midnight",
+                "backupCount": 7,
+                "encoding": "utf-8",
+            },
+        },
+        "loggers": {
+            "meteo": {
+                "handlers": ["console", "app_file"],
+                "level": LOG_LEVEL,
+                "propagate": False,
+            },
+        },
+    }
+
+    if LOG_TO_FILE:
+        config["handlers"]["ingest_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "json",
+            "level": LOG_LEVEL,
+            "filename": LOG_PATH,
+            "maxBytes": 1_048_576,
+            "backupCount": 5,
+            "encoding": "utf-8",
+        }
+        config["loggers"]["meteo.ingest"] = {
+            "handlers": ["console", "app_file", "ingest_file"],
+            "level": LOG_LEVEL,
+            "propagate": False,
+        }
+    else:
+        config["loggers"]["meteo.ingest"] = {
+            "handlers": ["console", "app_file"],
+            "level": LOG_LEVEL,
+            "propagate": False,
+        }
+
+    config["loggers"]["meteo.store"] = config["loggers"]["meteo.ingest"]
+
+    logging.config.dictConfig(config)
+
+
+configure_logging()
+logger = logging.getLogger("meteo")
+ingest_logger = logging.getLogger("meteo.ingest")
+store_logger = logging.getLogger("meteo.store")
 
 
 # -------------------------- utils --------------------------
@@ -108,9 +201,15 @@ class Store:
                     st = Station(id=sid, code=code, name=name, lat=float(lat), lon=float(lon))
                     self.stations[sid] = st
                     count += 1
-                print(f"[store] loaded {count} station(s) from {STATIONS_FILE}")
+                store_logger.info(
+                    "stations loaded",
+                    extra={"station_id": "", "metric_count": count},
+                )
         except Exception as e:
-            print(f"[store] load stations failed: {e}")
+            store_logger.error(
+                "load stations failed",
+                extra={"error": str(e)},
+            )
 
     def _save_stations(self):
         if not PERSIST_STATIONS:
@@ -123,7 +222,10 @@ class Store:
                 json.dump({"items": items}, f, ensure_ascii=False, indent=2)
             tmp.replace(STATIONS_FILE)
         except Exception as e:
-            print(f"[store] save stations failed: {e}")
+            store_logger.error(
+                "save stations failed",
+                extra={"error": str(e)},
+            )
 
     # --- stations ---
     def add_station(self, lat: float, lon: float, name: Optional[str] = "Station") -> Station:
@@ -245,20 +347,48 @@ def parse_packet_042(text: str) -> Tuple[str, Dict[str, float], Dict[str, str], 
     return sid, measurements, status, cloud
 
 
-# -------------------------- ingest logging --------------------------
+# -------------------------- ingest logging & metrics --------------------------
 INGEST_LOG_MEM: deque[str] = deque(maxlen=1000)
 
+INGEST_SUCCESS_COUNTER = Counter(
+    "meteo_ingest_success_total",
+    "Number of successfully ingested packets",
+    labelnames=["station_id"],
+)
+INGEST_ERROR_COUNTER = Counter(
+    "meteo_ingest_error_total",
+    "Number of ingest errors grouped by reason",
+    labelnames=["reason"],
+)
+INGEST_PARSE_DURATION = Histogram(
+    "meteo_ingest_parse_seconds",
+    "Time spent parsing ingest payloads",
+)
+INGEST_SAVE_DURATION = Histogram(
+    "meteo_ingest_save_seconds",
+    "Time spent saving ingest payloads",
+)
 
-def log_ingest(ts: int, station_id: str, raw: str):
-    line = f"{ts}\t{station_id}\t{raw}\n"
+
+def log_ingest(ts: int, station_id: str, raw: str, metric_count: int = 0, error: str = ""):
+    entry = {
+        "ts": ts,
+        "station_id": station_id,
+        "metric_count": metric_count,
+        "error": error,
+        "raw": raw,
+    }
+    line = json.dumps(entry, ensure_ascii=False)
     INGEST_LOG_MEM.append(line)
-    if LOG_TO_FILE:
-        try:
-            _ensure_log_dir()
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception:
-            pass
+    ingest_logger.info(
+        "ingest",
+        extra={
+            "station_id": station_id,
+            "metric_count": metric_count,
+            "error": error,
+            "raw": raw,
+        },
+    )
 
 
 # -------------------------- FastAPI app --------------------------
@@ -294,6 +424,11 @@ async def health():
         "stations_file": str(STATIONS_FILE),
         "persist": bool(PERSIST_STATIONS),
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/version")
@@ -337,32 +472,55 @@ LAST_RAW: Dict[str, Tuple[str, int]] = {}  # sid -> (raw, ts)
 async def ingest(req: Request):
     raw_bytes = await req.body()
     if not raw_bytes:
+        INGEST_ERROR_COUNTER.labels(reason="empty_body").inc()
         raise HTTPException(status_code=400, detail="empty body")
     if len(raw_bytes) > MAX_PACKET_LEN:
+        INGEST_ERROR_COUNTER.labels(reason="too_large").inc()
         raise HTTPException(status_code=413, detail="packet too large")
 
     raw = raw_bytes.decode("utf-8", errors="ignore").strip()
     if not raw:
+        INGEST_ERROR_COUNTER.labels(reason="empty_body").inc()
         raise HTTPException(status_code=400, detail="empty body")
 
+    parse_started = time.perf_counter()
     try:
         sid, measures, status, cloud = parse_packet_042(raw)
     except Exception as e:
+        INGEST_PARSE_DURATION.observe(time.perf_counter() - parse_started)
+        INGEST_ERROR_COUNTER.labels(reason="parse_error").inc()
+        ingest_logger.error(
+            "parse error",
+            extra={"error": str(e), "metric_count": 0, "station_id": ""},
+        )
         raise HTTPException(status_code=400, detail=f"parse error: {e}")
+    INGEST_PARSE_DURATION.observe(time.perf_counter() - parse_started)
 
     if sid not in store.stations:
         # detail intentionally contains normalized id without 'st-' for parity with prior UI messages
         short = sid[3:] if sid.startswith("st-") else sid
+        INGEST_ERROR_COUNTER.labels(reason="unknown_station").inc()
+        ingest_logger.warning(
+            "unknown station",
+            extra={"station_id": sid, "error": "unknown station"},
+        )
         raise HTTPException(status_code=404, detail=f"unknown station: {short}")
 
     ts = _now_ts()
     LAST_RAW[sid] = (raw, ts)
-    log_ingest(ts, sid, raw)
+    log_ingest(ts, sid, raw, metric_count=len(measures))
 
     stored = 0
+    save_started = time.perf_counter()
     for k, v in measures.items():
         store.add_point(sid, k, v, ts)
         stored += 1
+    INGEST_SAVE_DURATION.observe(time.perf_counter() - save_started)
+    INGEST_SUCCESS_COUNTER.labels(station_id=sid).inc()
+    ingest_logger.info(
+        "ingest stored",
+        extra={"station_id": sid, "metric_count": stored},
+    )
 
     return {"ok": True, "station_id": sid, "stored": stored}
 
@@ -458,7 +616,7 @@ async def run_mes0_tcp_server(host: str = "0.0.0.0", port: int = 9001):
 
             ts = _now_ts()
             LAST_RAW[sid] = (text, ts)
-            log_ingest(ts, sid, text)
+            log_ingest(ts, sid, text, metric_count=len(measures))
 
             for k, v in measures.items():
                 store.add_point(sid, k, v, ts)
@@ -471,7 +629,7 @@ async def run_mes0_tcp_server(host: str = "0.0.0.0", port: int = 9001):
 
     server = await asyncio.start_server(handle, host=host, port=port)
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-    print(f"[tcp] MES0 server on {addrs}")
+    logger.info("MES0 server started", extra={"metric_count": 0, "station_id": ""})
     async with server:
         await server.serve_forever()
 
@@ -482,9 +640,12 @@ async def run_demo_telegram_alerts():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
-        print("[telegram] skipped (no TOKEN/CHAT_ID)")
+        logger.warning(
+            "telegram alerts skipped",
+            extra={"error": "missing TOKEN/CHAT_ID"},
+        )
         return
-    print("[telegram] demo alerts started (period=10s)")
+    logger.info("telegram alerts started", extra={"metric_count": 0})
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     i = 0
     while True:
