@@ -713,9 +713,17 @@ async def run_demo_telegram_alerts(period_sec: int = 10):
                 txt = f"Demo alert {i} @ {_now_ts()}"
                 try:
                     await cli.post(url, json={"chat_id": chat_id, "text": txt})
+                except asyncio.CancelledError:
+                    logger.info("[telegram] demo alerts stopped")
+                    raise
                 except Exception:
                     logger.exception("[telegram] send demo alert failed")
-                await asyncio.sleep(max(1, period_sec))
+
+                try:
+                    await asyncio.sleep(max(1, period_sec))
+                except asyncio.CancelledError:
+                    logger.info("[telegram] demo alerts stopped")
+                    raise
         except asyncio.CancelledError:
             logger.info("[telegram] demo alerts stopped")
             raise
@@ -740,6 +748,10 @@ async def stop_demo_alerts():
     global _demo_alert_task
 
     if not _demo_alert_task:
+        return {"ok": True, "status": "not_running"}
+
+    if _demo_alert_task.done():
+        _demo_alert_task = None
         return {"ok": True, "status": "not_running"}
 
     _demo_alert_task.cancel()
