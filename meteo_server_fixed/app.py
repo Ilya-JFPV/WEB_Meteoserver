@@ -2,7 +2,6 @@
 # Encoding: UTF-8
 
 import os
-import re
 import json
 import time
 import asyncio
@@ -25,6 +24,7 @@ from prometheus_client import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from protocol.parser import normalize_station_id, parse_packet_042, parse_status_and_cloud
 
 # -------------------------- configuration --------------------------
 APP_VERSION = "0.9.2"
@@ -64,13 +64,6 @@ STARTED_AT = int(time.time())
 # -------------------------- utils --------------------------
 def _now_ts() -> int:
     return int(time.time())
-
-
-def _to_float(x: str) -> Optional[float]:
-    try:
-        return float(x.replace(",", "."))
-    except Exception:
-        return None
 
 
 def _ensure_log_dir():
@@ -266,10 +259,7 @@ class Store:
                     name = it.get("name") or "Station"
                     if not sid or lat is None or lon is None:
                         continue
-                    sid = str(sid)
-                    # normalize IDs stored without 'st-' but 8 hex
-                    if sid and not sid.startswith("st-") and re.fullmatch(r"[0-9A-Fa-f]{8}", sid):
-                        sid = f"st-{sid.lower()}"
+                    sid = normalize_station_id(str(sid))
                     code = it.get("code") or sid
                     st = Station(id=sid, code=code, name=name, lat=float(lat), lon=float(lon))
                     self.stations[sid] = st
@@ -332,88 +322,6 @@ class Store:
 
 
 store = Store()
-
-
-# -------------------------- parser 0.4.2 (+wrappers) --------------------------
-KNOWN_FIELDS = {"Sa0", "Ta1", "Hr1", "Pa2", "Or3", "Rt4", "Ri4", "Ra4", "Rs4", "Hc5"}
-
-
-def _extract_after_msr(text: str) -> Optional[Tuple[str, List[str]]]:
-    m = re.search(r"MSR([A-Za-z0-9_\-]+)", text)
-    if not m:
-        return None
-    sid = m.group(1)
-    rest = text[m.end():]
-    if rest.startswith(","):
-        rest = rest[1:]
-    parts = [p.strip() for p in rest.strip().split(",") if p.strip() != ""]
-    return sid, parts
-
-
-def parse_packet_042(text: str) -> Tuple[str, Dict[str, float], Dict[str, str], Optional[Dict]]:
-    found = _extract_after_msr(text)
-    if not found:
-        raise ValueError("MSR segment not found")
-    sid, parts = found
-
-    # accept both "st-XXXXXXXX" and "XXXXXXXX" (8-hex without prefix)
-    if not sid.startswith("st-") and re.fullmatch(r"[0-9A-Fa-f]{8}", sid):
-        sid = f"st-{sid.lower()}"
-
-    measurements: Dict[str, float] = {}
-    status: Dict[str, str] = {}
-    cloud: Optional[Dict] = None
-
-    i = 0
-    cur: Optional[str] = None
-    while i < len(parts):
-        tok = parts[i]
-        tagm = re.fullmatch(r"([A-Za-z]{2}\d)", tok)
-        if tagm:
-            cur = tagm.group(1)
-            i += 1
-            continue
-
-        if cur is None:
-            i += 1
-            continue
-
-        if cur.startswith("Er") or cur.startswith("St"):
-            if cur not in status:
-                status[cur] = parts[i]
-            i += 1
-            continue
-
-        if cur == "Hc5":
-            layers = _to_float(parts[i])
-            if layers is not None:
-                measurements["Hc5"] = layers
-                hs: List[float] = []
-                j = i + 1
-                for _ in range(4):
-                    if j < len(parts):
-                        vv = _to_float(parts[j])
-                        if vv is not None:
-                            hs.append(vv)
-                            j += 1
-                        else:
-                            break
-                cloud = {"layers": int(layers), "h": hs}
-                i = j
-                continue
-            i += 1
-            continue
-
-        if cur in KNOWN_FIELDS:
-            val = _to_float(parts[i])
-            if val is not None:
-                measurements[cur] = val
-            i += 1
-            continue
-
-        i += 1
-
-    return sid, measurements, status, cloud
 
 
 # -------------------------- ingest logging --------------------------
@@ -580,40 +488,7 @@ async def status_last(station_id: str):
     if not raw:
         return {"station_id": station_id, "status": {}, "ts": None, "cloud": None}
 
-    status: Dict[str, str] = {}
-    cloud: Optional[Dict] = None
-
-    found = _extract_after_msr(raw)
-    if found:
-        _, parts = found
-        i = 0
-        cur = None
-        while i < len(parts):
-            tok = parts[i]
-            m = re.fullmatch(r"([A-Za-z]{2}\d)", tok)
-            if m:
-                cur = m.group(1); i += 1; continue
-            if cur is None:
-                i += 1; continue
-            if cur.startswith("Er") or cur.startswith("St"):
-                if cur not in status:
-                    status[cur] = parts[i]
-                i += 1; continue
-            if cur == "Hc5":
-                layers = _to_float(parts[i])
-                if layers is not None:
-                    hs: List[float] = []
-                    j = i + 1
-                    for _ in range(4):
-                        if j < len(parts):
-                            vv = _to_float(parts[j])
-                            if vv is not None:
-                                hs.append(vv); j += 1
-                            else:
-                                break
-                    cloud = {"layers": int(layers), "h": hs}
-                    i = j; continue
-            i += 1
+    status, cloud = parse_status_and_cloud(raw)
 
     return {"station_id": station_id, "status": status, "ts": ts, "cloud": cloud}
 
