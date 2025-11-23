@@ -55,6 +55,7 @@ STATIC_DIR = BASE_DIR / "static"
 # optional subsystems
 ENABLE_TCP = int(os.getenv("ENABLE_TCP", "1"))                    # 1 — run TCP MES0 on port 9001
 DEMO_TG = os.getenv("DEMO_TELEGRAM_ALERTS", "0") == "1"           # 1 — run demo Telegram alerts
+_demo_alert_task: Optional[asyncio.Task] = None
 
 # auth
 API_KEY_HEADER = os.getenv("API_KEY_HEADER", "X-API-Key")
@@ -692,25 +693,74 @@ async def run_mes0_tcp_server(host: str = "0.0.0.0", port: int = 9001):
 
 
 # ---------- Telegram demo alerts ----------
-async def run_demo_telegram_alerts():
+async def run_demo_telegram_alerts(period_sec: int = 10):
     import httpx
+
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         logger.warning("[telegram] skipped (no TOKEN/CHAT_ID)")
         return
-    logger.info("[telegram] demo alerts started", extra={"period_s": 10})
+
+    logger.info("[telegram] demo alerts started", extra={"period_s": period_sec})
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     i = 0
-    while True:
-        try:
-            i += 1
-            txt = f"Demo alert {i} @ {_now_ts()}"
-            async with httpx.AsyncClient(timeout=10) as cli:
-                await cli.post(url, json={"chat_id": chat_id, "text": txt})
-        except Exception:
-            logger.exception("[telegram] send demo alert failed")
-        await asyncio.sleep(10)
+
+    try:
+        while True:
+            try:
+                i += 1
+                txt = f"Demo alert {i} @ {_now_ts()}"
+                async with httpx.AsyncClient(timeout=10) as cli:
+                    await cli.post(url, json={"chat_id": chat_id, "text": txt})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[telegram] send demo alert failed")
+            await asyncio.sleep(max(1, period_sec))
+    except asyncio.CancelledError:
+        logger.info("[telegram] demo alerts stopped")
+        raise
+
+
+async def start_demo_alerts(period_sec: int = 10):
+    global _demo_alert_task
+
+    if _demo_alert_task and not _demo_alert_task.done():
+        return {"ok": True, "status": "already_running"}
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"}
+
+    _demo_alert_task = asyncio.create_task(run_demo_telegram_alerts(period_sec=period_sec))
+    return {"ok": True, "period_sec": period_sec}
+
+
+async def stop_demo_alerts():
+    global _demo_alert_task
+
+    if not _demo_alert_task:
+        return {"ok": True, "status": "not_running"}
+
+    _demo_alert_task.cancel()
+    try:
+        await _demo_alert_task
+    except asyncio.CancelledError:
+        pass
+    _demo_alert_task = None
+    return {"ok": True, "status": "stopped"}
+
+
+@app.post("/alerts/demo/start")
+async def alerts_demo_start(period_sec: int = Query(10, ge=1, le=3600)):
+    return await start_demo_alerts(period_sec=period_sec)
+
+
+@app.post("/alerts/demo/stop")
+async def alerts_demo_stop():
+    return await stop_demo_alerts()
 
 
 # ---------- demo filler ----------
@@ -732,4 +782,4 @@ async def _startup():
     if ENABLE_TCP:
         asyncio.create_task(run_mes0_tcp_server(host="0.0.0.0", port=9001))
     if DEMO_TG:
-        asyncio.create_task(run_demo_telegram_alerts())
+        await start_demo_alerts()
