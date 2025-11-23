@@ -3,17 +3,20 @@
 
 import os
 import re
-import json
 import time
 import asyncio
 from pathlib import Path
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import Depends, FastAPI, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from .db_sqlite import SQLiteStore
+from .models.store import Station, StationIn, StoreProtocol
+from .store_memory import MemoryStore
 
 # -------------------------- configuration --------------------------
 APP_VERSION = "0.9.2"
@@ -34,6 +37,8 @@ PERSIST_STATIONS = int(os.getenv("PERSIST_STATIONS", "1"))
 BASE_DIR = Path(__file__).resolve().parent
 _ST_PATH_ENV = os.getenv("STATIONS_PATH", "stations.json")
 STATIONS_FILE: Path = Path(_ST_PATH_ENV) if Path(_ST_PATH_ENV).is_absolute() else (BASE_DIR / _ST_PATH_ENV)
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "memory").lower()
+SQLITE_PATH = os.getenv("SQLITE_PATH", str(BASE_DIR / "meteo.db"))
 
 # optional subsystems
 ENABLE_TCP = int(os.getenv("ENABLE_TCP", "1"))                    # 1 — run TCP MES0 on port 9001
@@ -59,108 +64,23 @@ def _ensure_log_dir():
         os.makedirs(LOG_DIR, exist_ok=True)
 
 
-# -------------------------- models / store --------------------------
-class Station(BaseModel):
-    id: str
-    name: str = "Station"
-    lat: float
-    lon: float
-    code: str
+# -------------------------- store selection --------------------------
+def create_store() -> StoreProtocol:
+    if STORAGE_BACKEND == "sqlite":
+        return SQLiteStore(Path(SQLITE_PATH))
+    return MemoryStore(
+        stations_file=STATIONS_FILE if PERSIST_STATIONS else None,
+        persist_stations=bool(PERSIST_STATIONS),
+        max_points_per_field=MAX_POINTS_PER_FIELD,
+        trim_to=TRIM_TO,
+    )
 
 
-class StationIn(BaseModel):
-    name: Optional[str] = Field(default="Station")
-    lat: float
-    lon: float
+store: StoreProtocol = create_store()
 
 
-class Store:
-    def __init__(self):
-        self.stations: Dict[str, Station] = {}  # station_id -> Station
-        self.points: Dict[str, Dict[str, List[Tuple[int, float]]]] = {}  # sid -> field -> [(ts,val)]
-        if PERSIST_STATIONS:
-            self._load_stations()
-
-    # ---- persistence ----
-    def _load_stations(self):
-        try:
-            if STATIONS_FILE.exists():
-                with open(STATIONS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                items = data.get("items") if isinstance(data, dict) else data
-                if not isinstance(items, list):
-                    return
-                count = 0
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    sid = it.get("id") or it.get("code")
-                    lat = it.get("lat")
-                    lon = it.get("lon")
-                    name = it.get("name") or "Station"
-                    if not sid or lat is None or lon is None:
-                        continue
-                    sid = str(sid)
-                    # normalize IDs stored without 'st-' but 8 hex
-                    if sid and not sid.startswith("st-") and re.fullmatch(r"[0-9A-Fa-f]{8}", sid):
-                        sid = f"st-{sid.lower()}"
-                    code = it.get("code") or sid
-                    st = Station(id=sid, code=code, name=name, lat=float(lat), lon=float(lon))
-                    self.stations[sid] = st
-                    count += 1
-                print(f"[store] loaded {count} station(s) from {STATIONS_FILE}")
-        except Exception as e:
-            print(f"[store] load stations failed: {e}")
-
-    def _save_stations(self):
-        if not PERSIST_STATIONS:
-            return
-        try:
-            items = [s.model_dump() for s in self.stations.values()]
-            STATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = STATIONS_FILE.with_suffix(".json.tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"items": items}, f, ensure_ascii=False, indent=2)
-            tmp.replace(STATIONS_FILE)
-        except Exception as e:
-            print(f"[store] save stations failed: {e}")
-
-    # --- stations ---
-    def add_station(self, lat: float, lon: float, name: Optional[str] = "Station") -> Station:
-        suffix = f"{_now_ts():08x}"[-8:]
-        sid = f"st-{suffix}"
-        st = Station(id=sid, code=sid, name=name or "Station", lat=lat, lon=lon)
-        self.stations[sid] = st
-        self._save_stations()
-        return st
-
-    def list_stations(self) -> List[Station]:
-        return list(self.stations.values())
-
-    # --- points ---
-    def add_point(self, sid: str, field: str, value: float, ts: Optional[int] = None):
-        ts = ts or _now_ts()
-        by_field = self.points.setdefault(sid, {})
-        arr = by_field.setdefault(field, [])
-        arr.append((ts, float(value)))
-        if len(arr) > MAX_POINTS_PER_FIELD:
-            by_field[field] = arr[-TRIM_TO:]
-
-    def range(self, sid: str, fields: List[str], minutes: int) -> Dict:
-        ts_to = _now_ts()
-        ts_from = ts_to - minutes * 60
-        out_ts: List[int] = [ts_to]
-        series: Dict[str, List[float]] = {f: [] for f in fields}
-        for f in fields:
-            pts = [v for (t, v) in self.points.get(sid, {}).get(f, []) if t >= ts_from]
-            if pts:
-                series[f].append(pts[-1])
-            else:
-                series[f] = []
-        return {"ts": out_ts, "series": series, "units": "metric"}
-
-
-store = Store()
+def get_store_dep() -> StoreProtocol:
+    return store
 
 
 # -------------------------- parser 0.4.2 (+wrappers) --------------------------
@@ -283,16 +203,16 @@ async def index():
 
 # --- service endpoints ---
 @app.get("/health")
-async def health():
-    points_fields = sum(len(v) for v in store.points.values())
+async def health(store_dep: StoreProtocol = Depends(get_store_dep)):
+    points_fields = store_dep.points_fields_count()
     return {
         "ok": True,
         "now": _now_ts(),
         "uptime_s": _now_ts() - STARTED_AT,
-        "stations": len(store.stations),
+        "stations": store_dep.stations_count(),
         "fields_per_stations": points_fields,
-        "stations_file": str(STATIONS_FILE),
-        "persist": bool(PERSIST_STATIONS),
+        "stations_file": str(store_dep.stations_file) if store_dep.stations_file else None,
+        "persist": bool(store_dep.persist_enabled),
     }
 
 
@@ -313,13 +233,13 @@ class StationsListOut(BaseModel):
 
 
 @app.get("/stations/list", response_model=StationsListOut)
-async def stations_list():
-    return {"items": store.list_stations()}
+async def stations_list(store_dep: StoreProtocol = Depends(get_store_dep)):
+    return {"items": store_dep.list_stations()}
 
 
 @app.post("/stations")
-async def stations_create(st: StationIn):
-    s = store.add_station(lat=st.lat, lon=st.lon, name=st.name)
+async def stations_create(st: StationIn, store_dep: StoreProtocol = Depends(get_store_dep)):
+    s = store_dep.add_station(lat=st.lat, lon=st.lon, name=st.name)
     return s.model_dump()
 
 
@@ -334,7 +254,7 @@ LAST_RAW: Dict[str, Tuple[str, int]] = {}  # sid -> (raw, ts)
 
 
 @app.post("/ingest", response_model=IngestResult)
-async def ingest(req: Request):
+async def ingest(req: Request, store_dep: StoreProtocol = Depends(get_store_dep)):
     raw_bytes = await req.body()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="empty body")
@@ -350,7 +270,7 @@ async def ingest(req: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"parse error: {e}")
 
-    if sid not in store.stations:
+    if not store_dep.get_station(sid):
         # detail intentionally contains normalized id without 'st-' for parity with prior UI messages
         short = sid[3:] if sid.startswith("st-") else sid
         raise HTTPException(status_code=404, detail=f"unknown station: {short}")
@@ -361,7 +281,7 @@ async def ingest(req: Request):
 
     stored = 0
     for k, v in measures.items():
-        store.add_point(sid, k, v, ts)
+        store_dep.add_point(sid, k, v, ts)
         stored += 1
 
     return {"ok": True, "station_id": sid, "stored": stored}
@@ -372,11 +292,12 @@ async def ingest(req: Request):
 async def measurements_range(station_id: str,
                              minutes: int = 60,
                              fields: str = "Sa0,Ta1,Hr1,Pa2,Or3,Rt4,Ri4,Ra4,Rs4,Hc5",
-                             units: str = "metric"):
-    if station_id not in store.stations:
+                             units: str = "metric",
+                             store_dep: StoreProtocol = Depends(get_store_dep)):
+    if not store_dep.get_station(station_id):
         raise HTTPException(status_code=404, detail="station not found")
     fld = [f.strip() for f in fields.split(",") if f.strip()]
-    return store.range(station_id, fld, minutes)
+    return store_dep.range(station_id, fld, minutes)
 
 
 # ---------- status / cloud from last raw ----------
@@ -453,7 +374,7 @@ async def run_mes0_tcp_server(host: str = "0.0.0.0", port: int = 9001):
                 sid, measures, _status, _cloud = parse_packet_042(text)
             except Exception:
                 return
-            if sid not in store.stations:
+            if not store.get_station(sid):
                 return
 
             ts = _now_ts()
@@ -500,12 +421,12 @@ async def run_demo_telegram_alerts():
 
 # ---------- demo filler ----------
 @app.post("/demo/fill")
-async def demo_fill():
-    if not store.stations:
-        s = store.add_station(59.871644, 29.819128, "Station")
-        store.add_station(59.93, 30.31, "Station")
+async def demo_fill(store_dep: StoreProtocol = Depends(get_store_dep)):
+    if store_dep.stations_count() == 0:
+        s = store_dep.add_station(59.871644, 29.819128, "Station")
+        store_dep.add_station(59.93, 30.31, "Station")
         for k, v in {"Sa0": 3.5, "Ta1": 10.5, "Hr1": 29, "Pa2": 1002.8}.items():
-            store.add_point(s.id, k, v, _now_ts())
+            store_dep.add_point(s.id, k, v, _now_ts())
     return {"ok": True}
 
 
