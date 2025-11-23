@@ -1,15 +1,16 @@
 # app.py — Meteo Server (parametric, protocol 0.4.2) with persistence, status cache, TCP ingest
 # Encoding: UTF-8
 
-import os
-import json
-import time
 import asyncio
+import json
 import logging
 import logging.config
+import logging.handlers
+import os
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Query, Header, Response
@@ -49,6 +50,7 @@ PERSIST_STATIONS = int(os.getenv("PERSIST_STATIONS", "1"))
 BASE_DIR = Path(__file__).resolve().parent
 _ST_PATH_ENV = os.getenv("STATIONS_PATH", "stations.json")
 STATIONS_FILE: Path = Path(_ST_PATH_ENV) if Path(_ST_PATH_ENV).is_absolute() else (BASE_DIR / _ST_PATH_ENV)
+STATIC_DIR = BASE_DIR / "static"
 
 # optional subsystems
 ENABLE_TCP = int(os.getenv("ENABLE_TCP", "1"))                    # 1 — run TCP MES0 on port 9001
@@ -59,6 +61,93 @@ API_KEY_HEADER = os.getenv("API_KEY_HEADER", "X-API-Key")
 API_KEY = os.getenv("API_KEY")
 
 STARTED_AT = int(time.time())
+
+
+# -------------------------- logging setup --------------------------
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+            "station_id": getattr(record, "station_id", ""),
+            "metric_count": getattr(record, "metric_count", 0),
+            "error": getattr(record, "error", ""),
+            "raw": getattr(record, "raw", ""),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging():
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "json": {
+                "()": JsonFormatter,
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "json",
+                "level": LOG_LEVEL,
+            },
+            "app_file": {
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "formatter": "json",
+                "level": LOG_LEVEL,
+                "filename": APP_LOG_PATH,
+                "when": "midnight",
+                "backupCount": 7,
+                "encoding": "utf-8",
+            },
+        },
+        "loggers": {
+            "meteo": {
+                "handlers": ["console", "app_file"],
+                "level": LOG_LEVEL,
+                "propagate": False,
+            },
+        },
+    }
+
+    if LOG_TO_FILE:
+        config["handlers"]["ingest_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "json",
+            "level": LOG_LEVEL,
+            "filename": LOG_PATH,
+            "maxBytes": 1_048_576,
+            "backupCount": 5,
+            "encoding": "utf-8",
+        }
+        config["loggers"]["meteo.ingest"] = {
+            "handlers": ["console", "app_file", "ingest_file"],
+            "level": LOG_LEVEL,
+            "propagate": False,
+        }
+    else:
+        config["loggers"]["meteo.ingest"] = {
+            "handlers": ["console", "app_file"],
+            "level": LOG_LEVEL,
+            "propagate": False,
+        }
+
+    config["loggers"]["meteo.store"] = config["loggers"]["meteo.ingest"]
+
+    logging.config.dictConfig(config)
+
+
+configure_logging()
+logger = logging.getLogger("meteo")
+ingest_logger = logging.getLogger("meteo.ingest")
+store_logger = logging.getLogger("meteo.store")
 
 
 # -------------------------- utils --------------------------
@@ -236,6 +325,8 @@ class Store:
     def __init__(self):
         self.stations: Dict[str, Station] = {}  # station_id -> Station
         self.points: Dict[str, Dict[str, List[Tuple[int, float]]]] = {}  # sid -> field -> [(ts,val)]
+        self.stations_file = STATIONS_FILE
+        self.persist_enabled = bool(PERSIST_STATIONS)
         if PERSIST_STATIONS:
             self._load_stations()
         update_state_metrics(self)
@@ -320,16 +411,57 @@ class Store:
                 series[f] = []
         return {"ts": out_ts, "series": series, "units": "metric"}
 
+    # --- meta ---
+    def stations_count(self) -> int:
+        return len(self.stations)
+
+    def points_fields_count(self) -> int:
+        return sum(len(v) for v in self.points.values())
+
 
 store = Store()
+
+
+def get_store_dep() -> Store:
+    return store
 
 
 # -------------------------- ingest logging --------------------------
 INGEST_LOG_MEM: deque[str] = deque(maxlen=1000)
 
+INGEST_SUCCESS_COUNTER = Counter(
+    "meteo_ingest_success_total",
+    "Number of successfully ingested packets",
+    labelnames=["station_id"],
+    registry=METRICS_REGISTRY,
+)
+INGEST_ERROR_COUNTER = Counter(
+    "meteo_ingest_error_total",
+    "Number of ingest errors grouped by reason",
+    labelnames=["reason"],
+    registry=METRICS_REGISTRY,
+)
+INGEST_PARSE_DURATION = Histogram(
+    "meteo_ingest_parse_seconds",
+    "Time spent parsing ingest payloads",
+    registry=METRICS_REGISTRY,
+)
+INGEST_SAVE_DURATION = Histogram(
+    "meteo_ingest_save_seconds",
+    "Time spent saving ingest payloads",
+    registry=METRICS_REGISTRY,
+)
 
-def log_ingest(ts: int, station_id: str, raw: str):
-    line = f"{ts}\t{station_id}\t{raw}\n"
+
+def log_ingest(ts: int, station_id: str, raw: str, metric_count: int = 0, error: str = ""):
+    entry = {
+        "ts": ts,
+        "station_id": station_id,
+        "metric_count": metric_count,
+        "error": error,
+        "raw": raw,
+    }
+    line = json.dumps(entry, ensure_ascii=False)
     INGEST_LOG_MEM.append(line)
     ingest_logger.info(
         "ingest packet accepted",
@@ -341,7 +473,7 @@ def log_ingest(ts: int, station_id: str, raw: str):
 app = FastAPI(title="Meteo Server (parametric)")
 
 # serve /static (index.html and client assets)
-app.mount("/static", StaticFiles(directory="static", html=False), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR, html=False), name="static")
 
 
 @app.middleware("http")
@@ -359,16 +491,16 @@ async def index():
 
 # --- service endpoints ---
 @app.get("/health")
-async def health():
-    points_fields = sum(len(v) for v in store.points.values())
+async def health(store_dep: Store = Depends(get_store_dep)):
+    points_fields = store_dep.points_fields_count()
     return {
         "ok": True,
         "now": _now_ts(),
         "uptime_s": _now_ts() - STARTED_AT,
-        "stations": len(store.stations),
+        "stations": store_dep.stations_count(),
         "fields_per_stations": points_fields,
-        "stations_file": str(STATIONS_FILE),
-        "persist": bool(PERSIST_STATIONS),
+        "stations_file": str(store_dep.stations_file) if store_dep.stations_file else None,
+        "persist": bool(store_dep.persist_enabled),
     }
 
 
@@ -394,8 +526,8 @@ class StationsListOut(BaseModel):
 
 
 @app.get("/stations/list", response_model=StationsListOut)
-async def stations_list():
-    return {"items": store.list_stations()}
+async def stations_list(store_dep: Store = Depends(get_store_dep)):
+    return {"items": store_dep.list_stations()}
 
 
 @app.post("/stations")
@@ -431,13 +563,15 @@ async def ingest(req: Request, auth=Depends(require_api_key)):
         INGEST_ERRORS_TOTAL.labels(type="empty_body").inc()
         raise HTTPException(status_code=400, detail="empty body")
 
+    parse_started = time.perf_counter()
     try:
         sid, measures, status, cloud = parse_packet_042(raw)
     except Exception as e:
         INGEST_ERRORS_TOTAL.labels(type="parse_error").inc()
         raise HTTPException(status_code=400, detail=f"parse error: {e}")
+    INGEST_PARSE_DURATION.observe(time.perf_counter() - parse_started)
 
-    if sid not in store.stations:
+    if not store_dep.get_station(sid):
         # detail intentionally contains normalized id without 'st-' for parity with prior UI messages
         short = sid[3:] if sid.startswith("st-") else sid
         INGEST_ERRORS_TOTAL.labels(type="unknown_station").inc()
@@ -474,11 +608,12 @@ async def ingest(req: Request, auth=Depends(require_api_key)):
 async def measurements_range(station_id: str,
                              minutes: int = 60,
                              fields: str = "Sa0,Ta1,Hr1,Pa2,Or3,Rt4,Ri4,Ra4,Rs4,Hc5",
-                             units: str = "metric"):
-    if station_id not in store.stations:
+                             units: str = "metric",
+                             store_dep: Store = Depends(get_store_dep)):
+    if not store_dep.get_station(station_id):
         raise HTTPException(status_code=404, detail="station not found")
     fld = [f.strip() for f in fields.split(",") if f.strip()]
-    return store.range(station_id, fld, minutes)
+    return store_dep.range(station_id, fld, minutes)
 
 
 # ---------- status / cloud from last raw ----------
@@ -529,7 +664,7 @@ async def run_mes0_tcp_server(host: str = "0.0.0.0", port: int = 9001):
 
             ts = _now_ts()
             LAST_RAW[sid] = (text, ts)
-            log_ingest(ts, sid, text)
+            log_ingest(ts, sid, text, metric_count=len(measures))
 
             for k, v in measures.items():
                 store.add_point(sid, k, v, ts)
@@ -581,7 +716,7 @@ async def demo_fill(auth=Depends(require_api_key)):
         s = store.add_station(59.871644, 29.819128, "Station")
         store.add_station(59.93, 30.31, "Station")
         for k, v in {"Sa0": 3.5, "Ta1": 10.5, "Hr1": 29, "Pa2": 1002.8}.items():
-            store.add_point(s.id, k, v, _now_ts())
+            store_dep.add_point(s.id, k, v, _now_ts())
     return {"ok": True}
 
 

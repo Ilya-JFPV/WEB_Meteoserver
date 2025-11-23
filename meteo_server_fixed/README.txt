@@ -44,3 +44,10 @@ MeteoServer Full Patch v13
   Invoke-RestMethod -Method Post -Uri $url -Headers @{ Authorization = "Bearer <YOUR_TOKEN>" } | Out-Null
   Start-Sleep -Milliseconds 120
 }
+
+Метрики Prometheus
+------------------
+- Эндпоинт `/metrics` отдаёт метрики Prometheus (используется `prometheus_client.generate_latest`).
+- Счётчики: `meteo_ingest_success_total{station_id="..."}` и `meteo_ingest_error_total{reason="..."}`.
+- Гистограммы: `meteo_ingest_parse_seconds` и `meteo_ingest_save_seconds` для времени разбора/сохранения пакета.
+- Для включения достаточно оставить зависимость `prometheus-client` из requirements и опубликовать `/metrics` в маршрутизации или scrape-конфиге Prometheus.
