@@ -707,21 +707,18 @@ async def run_demo_telegram_alerts(period_sec: int = 10):
     i = 0
 
     async with httpx.AsyncClient(timeout=10) as cli:
-        while True:
-            try:
+        try:
+            while True:
                 i += 1
                 txt = f"Demo alert {i} @ {_now_ts()}"
-                await cli.post(url, json={"chat_id": chat_id, "text": txt})
-            except asyncio.CancelledError:
-                logger.info("[telegram] demo alerts stopped")
-                raise
-            except Exception:
-                logger.exception("[telegram] send demo alert failed")
-            try:
+                try:
+                    await cli.post(url, json={"chat_id": chat_id, "text": txt})
+                except Exception:
+                    logger.exception("[telegram] send demo alert failed")
                 await asyncio.sleep(max(1, period_sec))
-            except asyncio.CancelledError:
-                logger.info("[telegram] demo alerts stopped")
-                raise
+        except asyncio.CancelledError:
+            logger.info("[telegram] demo alerts stopped")
+            raise
 
 
 async def start_demo_alerts(period_sec: int = 10):
