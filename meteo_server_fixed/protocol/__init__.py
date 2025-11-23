@@ -1,8 +1,13 @@
-import re, json, os
+import json
+import re
+from pathlib import Path
 from typing import Dict, Any
 
+
 def load_profiles() -> dict:
-    with open('protocol_profiles.json','r',encoding='utf-8') as f: return json.load(f)
+    base_dir = Path(__file__).resolve().parent.parent
+    with open(base_dir / "protocol_profiles.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 PROFILES = load_profiles()
 
 def build_config(profile: str) -> dict:
