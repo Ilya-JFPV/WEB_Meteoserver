@@ -1,13 +1,47 @@
 # tcp_ingest.py
-import asyncio, re, json, binascii
+import os, asyncio, re, json, binascii
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
 #     (Ta/Hr/Pa/Sa/Da/...  )
-TAGS = {"Ci","Cr","Cs","Da","Er","Fp","Gr","Hc","Hr","Or","Pa","Ra","Rc","Rh","Ri","Rs","Rt","Sa","St","Ta","Tf","Tr","Tt"
+TAGS = {"Ci","Cr","Cs","Da","Er","Fp","Gr","Hc","Hr","Or","Pa","Ra","Rc","Rh","Ri","Rs","Rt","Sa","St","Ta","Tf","Tr","Tt"}
 
 STX = 0x02  # <STX>
 ETX = 0x03  # <ETX>
+
+
+TCP_ALLOWED_IPS = {p.strip() for p in os.getenv("TCP_ALLOWED_IPS", "").split(",") if p.strip()}
+TCP_SHARED_SECRET = os.getenv("TCP_SHARED_SECRET")
+
+
+def _peer_ip(peer) -> Optional[str]:
+    if isinstance(peer, tuple) and peer:
+        return peer[0]
+    if peer:
+        return str(peer)
+    return None
+
+
+def _is_peer_allowed(peer) -> bool:
+    if not TCP_ALLOWED_IPS:
+        return True
+    ip = _peer_ip(peer)
+    return ip in TCP_ALLOWED_IPS
+
+
+async def _require_tcp_secret(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+    """Expect a single line with shared secret before processing frames."""
+    line = await reader.readline()
+    token = line.decode("ascii", "ignore").strip()
+    if not token:
+        return False
+    if token != TCP_SHARED_SECRET:
+        writer.write(b"ERR auth\r\n")
+        try:
+            await writer.drain()
+        finally:
+            return False
+    return True
 
 def _xor_checksum(payload: bytes) -> int:
     """XOR   payload ( '$'  '*',   )   ."""
@@ -116,6 +150,22 @@ class TcpIngestServer:
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
+        peer_allowed = _is_peer_allowed(peer)
+        if TCP_SHARED_SECRET:
+            require_secret = not TCP_ALLOWED_IPS or not peer_allowed
+            if require_secret:
+                allowed = await _require_tcp_secret(reader, writer)
+                if not allowed:
+                    writer.close()
+                    return
+        elif not peer_allowed:
+            print(f"[tcp-ingest] rejected connection from {peer} (not allowed)")
+            writer.write(b"ERR auth\r\n")
+            try:
+                await writer.drain()
+            finally:
+                writer.close()
+                return
         print(f"[tcp-ingest] connection from {peer}")
         buf = b""
         try:
