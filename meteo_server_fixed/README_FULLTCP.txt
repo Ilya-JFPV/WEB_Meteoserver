@@ -7,6 +7,12 @@ FULL MES0 ENHANCEMENT PACK
   - deploy/docker-compose.timescale.integrated.yml — стек с интегрированным TCP
   - deploy/systemd/meteoserver.service — unit для автозапуска compose (integrated-вариант)
   - deploy/cloud-init/yc-user-data.yaml — cloud-init для Yandex Cloud
+
+Безопасность TCP
+----------------
+- Для ограничения источников используйте ``TCP_ALLOWED_IPS`` (список IP через запятую) или общий секрет
+  ``TCP_SHARED_SECRET``. При задании секрета клиент должен первым сообщением отправить строку с ключом,
+  после чего переходить к кадрам MES0. Whitelist позволяет пропускать доверенные IP без секрета.
 Использование:
   Вариант SIDEcar:
     cd deploy

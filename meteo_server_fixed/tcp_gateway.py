@@ -3,8 +3,25 @@ import os, asyncio, re, httpx
 TCP_HOST = os.getenv("TCP_LISTEN_HOST", "0.0.0.0")
 TCP_PORT = int(os.getenv("TCP_LISTEN_PORT", "40000"))
 APP_HTTP_URL = os.getenv("APP_HTTP_URL", "http://127.0.0.1:8000")
+TCP_ALLOWED_IPS = {p.strip() for p in os.getenv("TCP_ALLOWED_IPS", "").split(",") if p.strip()}
+TCP_SHARED_SECRET = os.getenv("TCP_SHARED_SECRET")
 
 TAGS = ("Sa0","Ta1","Hr1","Pa2")
+
+
+def _peer_ip(peer):
+    if isinstance(peer, tuple) and peer:
+        return peer[0]
+    if peer:
+        return str(peer)
+    return None
+
+
+def _is_peer_allowed(peer) -> bool:
+    if not TCP_ALLOWED_IPS:
+        return True
+    ip = _peer_ip(peer)
+    return ip in TCP_ALLOWED_IPS
 
 def parse_frame_line(line: str):
     sid = "MSRXXXX"
@@ -30,6 +47,18 @@ def parse_frame_line(line: str):
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
+        peer = writer.get_extra_info("peername")
+        peer_allowed = _is_peer_allowed(peer)
+        if TCP_SHARED_SECRET:
+            require_secret = not TCP_ALLOWED_IPS or not peer_allowed
+            if require_secret:
+                secret_line = await reader.readline()
+                secret = secret_line.decode("ascii", "ignore").strip()
+                if not secret or secret != TCP_SHARED_SECRET:
+                    writer.write(b"ERR\n"); await writer.drain(); return
+        elif not peer_allowed:
+            writer.write(b"ERR\n"); await writer.drain(); return
+
         raw = await reader.readline()
         if not raw:
             writer.write(b"ERR\n"); await writer.drain(); return

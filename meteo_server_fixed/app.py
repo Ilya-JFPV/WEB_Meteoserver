@@ -10,7 +10,7 @@ from pathlib import Path
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import Depends, FastAPI, HTTPException, Request, Query, Header
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -39,6 +39,10 @@ STATIONS_FILE: Path = Path(_ST_PATH_ENV) if Path(_ST_PATH_ENV).is_absolute() els
 ENABLE_TCP = int(os.getenv("ENABLE_TCP", "1"))                    # 1 — run TCP MES0 on port 9001
 DEMO_TG = os.getenv("DEMO_TELEGRAM_ALERTS", "0") == "1"           # 1 — run demo Telegram alerts
 
+# auth
+API_KEY_HEADER = os.getenv("API_KEY_HEADER", "X-API-Key")
+API_KEY = os.getenv("API_KEY")
+
 STARTED_AT = int(time.time())
 
 
@@ -57,6 +61,20 @@ def _to_float(x: str) -> Optional[float]:
 def _ensure_log_dir():
     if LOG_TO_FILE and not os.path.isdir(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
+
+
+async def require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias=API_KEY_HEADER),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Check API key from header against API_KEY env (no-op if key not set)."""
+    if not API_KEY:
+        return
+    provided = x_api_key
+    if not provided and authorization and authorization.lower().startswith("bearer "):
+        provided = authorization.split(" ", 1)[1]
+    if provided != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
 
 
 # -------------------------- models / store --------------------------
@@ -302,7 +320,7 @@ async def version():
 
 
 @app.get("/logs/tail")
-async def logs_tail(n: int = Query(200, ge=1, le=1000)):
+async def logs_tail(n: int = Query(200, ge=1, le=1000), auth=Depends(require_api_key)):
     lines = list(INGEST_LOG_MEM)[-n:]
     return {"lines": lines, "path": LOG_PATH if LOG_TO_FILE else None}
 
@@ -318,7 +336,7 @@ async def stations_list():
 
 
 @app.post("/stations")
-async def stations_create(st: StationIn):
+async def stations_create(st: StationIn, auth=Depends(require_api_key)):
     s = store.add_station(lat=st.lat, lon=st.lon, name=st.name)
     return s.model_dump()
 
@@ -334,7 +352,7 @@ LAST_RAW: Dict[str, Tuple[str, int]] = {}  # sid -> (raw, ts)
 
 
 @app.post("/ingest", response_model=IngestResult)
-async def ingest(req: Request):
+async def ingest(req: Request, auth=Depends(require_api_key)):
     raw_bytes = await req.body()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="empty body")
@@ -500,7 +518,7 @@ async def run_demo_telegram_alerts():
 
 # ---------- demo filler ----------
 @app.post("/demo/fill")
-async def demo_fill():
+async def demo_fill(auth=Depends(require_api_key)):
     if not store.stations:
         s = store.add_station(59.871644, 29.819128, "Station")
         store.add_station(59.93, 30.31, "Station")
