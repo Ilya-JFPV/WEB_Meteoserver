@@ -1,0 +1,7 @@
+cd /d "D:\keil_projects\web-meteoserver\meteo_server_fixed"
+alerts_start.cmd
+
+
+cd /d "D:\keil_projects\web-meteoserver\meteo_server_fixed"
+alerts_stop.cmd
+

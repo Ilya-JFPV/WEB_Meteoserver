@@ -1,0 +1,10 @@
+# разово в текущей сессии
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+Set-Location "D:\GIT_FLICK\Python projects\Meteoserver\meteo_server_fixed"
+
+# значения по умолчанию внутри скрипта уже стоят
+.\launch_meteo_fixed2.ps1
+
+# либо с переопределением параметров:
+.\launch_meteo_fixed2.ps1 -ChatId "1051646619" -BotToken "8463...SqgLw" -Port 8080 -BindHost "127.0.0.1"

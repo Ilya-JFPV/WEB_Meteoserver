@@ -1,0 +1,26 @@
+{
+  "default": {
+    "key_pattern": "([A-Za-z]{2}\\d)",
+    "pair_delims": "[,;\\s]+",
+    "array_keys": [
+      "Sa0",
+      "Da0",
+      "Ta1",
+      "Hr1",
+      "Pa2",
+      "Or3",
+      "Er3",
+      "Rt4",
+      "Ri4",
+      "Vi5"
+    ],
+    "trend_suffix": "t",
+    "required": [],
+    "checksum": {
+      "enabled": true,
+      "field": "CS",
+      "algo": "sum16"
+    },
+    "strict_checksum": false
+  }
+}

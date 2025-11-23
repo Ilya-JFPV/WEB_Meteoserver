@@ -1,0 +1,38 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      - POSTGRES_DB=meteodb
+      - POSTGRES_USER=meteouser
+      - POSTGRES_PASSWORD=meteopass
+    ports: ["5432:5432"]
+    volumes: ["ts_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meteouser -d meteodb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: ../
+    command: bash -lc "gunicorn app_with_tcp:app -k uvicorn.workers.UvicornWorker -w 1 -b 0.0.0.0:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://meteouser:meteopass@timescaledb:5432/meteodb
+      - APP_VERSION=yc-deploy
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DEMO_TELEGRAM_ALERTS=${DEMO_TELEGRAM_ALERTS:-0}
+      - ALERT_PERIOD_SEC=${ALERT_PERIOD_SEC:-10}
+      - MES0_TCP_HOST=0.0.0.0
+      - MES0_TCP_PORT=${MES0_TCP_PORT:-9001}
+    ports:
+      - "8000:8000"
+      - "${MES0_TCP_PORT:-9001}:${MES0_TCP_PORT:-9001}/tcp"
+    volumes: ["../:/srv/app"]
+    working_dir: /srv/app
+
+volumes:
+  ts_data:

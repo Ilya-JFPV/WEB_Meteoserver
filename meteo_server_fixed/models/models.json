@@ -1,0 +1,17 @@
+{
+  "ultra_3beam_v1": {
+    "description": "Ultrasonic 3-beam",
+    "required": [
+      "Sa0",
+      "Da0",
+      "Ta1",
+      "Hr1",
+      "Pa2"
+    ],
+    "optional": [
+      "Rt4",
+      "Ri4",
+      "Vi5"
+    ]
+  }
+}

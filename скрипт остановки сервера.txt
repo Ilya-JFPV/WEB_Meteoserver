@@ -1,0 +1,5 @@
+# стоп демо-рассылки
+Invoke-RestMethod -Method POST http://127.0.0.1:8000/alerts/demo/stop
+
+# (при необходимости снова включить)
+# Invoke-RestMethod -Method POST http://127.0.0.1:8000/alerts/demo/start

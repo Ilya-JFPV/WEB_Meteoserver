@@ -1,0 +1,78 @@
+{
+  "ingest_token": "CHANGE_ME_GLOBAL_TOKEN",
+  "jwt_secret": "CHANGE_ME_JWT_SECRET",
+  "auto_rotate_days": 90,
+  "qc_bounds": {
+    "Sa0": [
+      0,
+      75
+    ],
+    "Da0": [
+      0,
+      360
+    ],
+    "Ta1": [
+      -60,
+      60
+    ],
+    "Hr1": [
+      0,
+      100
+    ],
+    "Pa2": [
+      870,
+      1100
+    ]
+  },
+  "qc_spike": {
+    "Sa0": 30,
+    "Ta1": 15,
+    "Pa2": 20,
+    "Hr1": 40
+  },
+  "alerts": {
+    "webhook_url": "",
+    "telegram": {
+      "bot_token": "",
+      "chat_id": ""
+    },
+    "email": {
+      "smtp_host": "",
+      "smtp_port": 587,
+      "user": "",
+      "password": "",
+      "from": "",
+      "to": ""
+    },
+    "rules": [
+      {
+        "station_id": "*",
+        "field": "Sa0",
+        "op": ">=",
+        "value": 25,
+        "message": "\u0428\u0442\u043e\u0440\u043c\u043e\u0432\u043e\u0439 \u0432\u0435\u0442\u0435\u0440"
+      }
+    ]
+  },
+  "rbac": {
+    "admin": [
+      "*"
+    ],
+    "ops": [
+      "stations:*",
+      "models:*",
+      "profiles:*",
+      "logs:read",
+      "alerts:read",
+      "import:*"
+    ],
+    "user": [
+      "stations:read",
+      "measurements:read"
+    ]
+  },
+  "audit": {
+    "file": "audit.log",
+    "enabled": true
+  }
+}

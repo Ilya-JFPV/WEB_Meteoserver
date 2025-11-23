@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.db
+meteo.db
+*.sqlite*
+audit.log
+*.zip
+.git
+.gitignore

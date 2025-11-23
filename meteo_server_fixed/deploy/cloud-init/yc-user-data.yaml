@@ -1,0 +1,9 @@
+#cloud-config
+package_update: true
+packages: [curl, git]
+
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker ubuntu
+  - mkdir -p /srv/app && chown -R ubuntu:ubuntu /srv/app
+  - bash -lc 'cd /srv/app/deploy && docker compose -f docker-compose.timescale.integrated.yml up -d --build'

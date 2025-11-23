@@ -1,0 +1,6 @@
+cd "D:\GIT_FLICK\Python projects\Meteoserver\meteo_server_fixed\scripts"
+.\send_http_mes0_042.ps1 -Url "http://127.0.0.1:8000/ingest" -StationId "st-6914df86"
+
+
+cd "D:\GIT_FLICK\Python projects\Meteoserver\meteo_server_fixed\scripts"
+py -3.11 .\send_tcp_mes0_042.py

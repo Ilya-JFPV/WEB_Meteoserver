@@ -1,0 +1,14 @@
+[Unit]
+Description=MeteoServer (docker compose, integrated TCP)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/app/deploy
+ExecStart=/usr/bin/docker compose -f docker-compose.timescale.integrated.yml up -d --build
+ExecStop=/usr/bin/docker compose -f docker-compose.timescale.integrated.yml down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+:: 0) перейти в папку проекта (ключ /d переключает диск)
+cd /d "D:\keil_projects\web-meteoserver\meteo_server_fixed"
+
+:: 1) активировать виртуальное окружение
+".venv\Scripts\activate.bat"
+
+:: 2) (разово, если ещё не ставили зависимости)
+py -3.11 -m pip install --upgrade pip
+py -3.11 -m pip install -r requirements.txt
+
+:: 3) задать переменные для Telegram (в ЭТОМ окне cmd)
+set TELEGRAM_BOT_TOKEN=8463154590:AAEW1E9v9nMhJ-bzS_THHNKtRs1L-jSqgLw
+set TELEGRAM_CHAT_ID=1051646619
+:: автостарт демо-алертов при запуске сервера (1=вкл, 0=выкл)
+set DEMO_TELEGRAM_ALERTS=1
+
+:: 4) запустить сервер
+py -3.11 -m uvicorn app:app --host 127.0.0.1 --port 8000 --app-dir "D:\keil_projects\web-meteoserver\meteo_server_fixed"

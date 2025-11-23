@@ -1,0 +1,212 @@
+﻿# app.py — Meteo Server (патч с демо-графиками и корректной статикой)
+
+import os
+import json
+import time
+import hmac
+import hashlib
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBearer
+from starlette.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+
+from sqlalchemy import create_engine, text as sqltext
+from sqlalchemy.exc import SQLAlchemyError
+
+# -----------------------------------------------------------------------------
+# Конфиг / RBAC (опционально, не критично для демо)
+# -----------------------------------------------------------------------------
+RBAC: Dict[str, str] = {}
+try:
+    # users.json вида: {"admin":"secret", "viewer":"pass"}
+    with open("users.json", "r", encoding="utf-8") as f:
+        RBAC = json.load(f)
+except Exception:
+    # файл не обязателен
+    RBAC = {}
+
+SECRET = os.getenv("JWT_SECRET", "change-me")
+TOKEN_TTL = 24 * 3600  # сек.
+
+def _sign(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sig = hmac.new(SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    return sig + "." + raw.hex()
+
+# -----------------------------------------------------------------------------
+# База данных
+# -----------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///meteo.db")  # по умолчанию SQLite
+engine = create_engine(DATABASE_URL, future=True)
+
+# -----------------------------------------------------------------------------
+# Приложение
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Meteo Server")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+security = HTTPBearer(auto_error=False)
+
+# -----------------------------------------------------------------------------
+# Вспомогательная логика (пример парсинга полезной нагрузки — оставлено как заглушка)
+# -----------------------------------------------------------------------------
+def parse_payload(raw: Any) -> dict:
+    """
+    Здесь можно разобрать строку протокола в структуру.
+    Сейчас возвращаем как есть.
+    """
+    if isinstance(raw, str):
+        return {"raw": raw}
+    if isinstance(raw, dict):
+        return raw
+    return {"raw": str(raw)}
+
+# -----------------------------------------------------------------------------
+# Эндпоинты
+# -----------------------------------------------------------------------------
+@app.post("/login")
+async def login(req: Request):
+    data = await req.json()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if RBAC and RBAC.get(username) != password:
+        raise HTTPException(401, "invalid credentials")
+    token = _sign({"sub": username or "guest", "role": username or "guest", "exp": time.time() + TOKEN_TTL})
+    return {"token": token}
+
+@app.get("/stations")
+async def stations():
+    """
+    Возвращает список станций.
+    Можно брать из БД (если есть таблица stations), иначе — демо.
+    """
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(sqltext(
+                "select id, name, lat, lon, coalesce(profile,'default') as profile from stations order by id"
+            )).fetchall()
+        if rows:
+            return [
+                {"id": r.id, "name": r.name, "lat": float(r.lat), "lon": float(r.lon), "profile": r.profile}
+                for r in rows
+            ]
+    except SQLAlchemyError:
+        pass  # таблицы может не быть — не страшно
+
+    # демо-станция для пустой БД
+    return [{"id": "demo-1", "name": "Demo station 1", "lat": 55.751244, "lon": 37.618423, "profile": "default"}]
+
+@app.post("/ingest")
+async def ingest(req: Request):
+    """
+    Приём измерений от устройств.
+    Ожидается JSON: {"station_id":"...", "payload": "...или объект..."}
+    Сохраняем в measurements, если таблица есть; иначе просто OK.
+    """
+    data = await req.json()
+    station_id = data.get("station_id") or "unknown"
+    payload = data.get("payload")
+    parsed = parse_payload(payload)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(sqltext("""
+                create table if not exists measurements (
+                    id bigserial primary key,
+                    station_id text not null,
+                    ts timestamptz not null default now(),
+                    raw text,
+                    parsed jsonb
+                )
+            """))
+            conn.execute(
+                sqltext("insert into measurements (station_id, raw, parsed) values (:sid, :raw, :parsed)"),
+                {"sid": station_id, "raw": json.dumps(payload, ensure_ascii=False), "parsed": json.dumps(parsed, ensure_ascii=False)}
+            )
+    except SQLAlchemyError:
+        # если БД не готова — просто подтверждаем
+        pass
+
+    return {"status": "ok"}
+
+# ---------------------- ПАТЧ: демо-данные для графиков -----------------------
+@app.get("/measurements/range")
+async def measurements_range(station_id: str, minutes: int = 120, fields: str = "", units: str = "metric"):
+    """
+    Возвращает временной ряд для заданных полей.
+    ПАТЧ: для station_id, начинающихся с 'demo-', генерируем демо-данные
+    без обращения к БД, чтобы графики работали «из коробки».
+    """
+    flds = [f for f in fields.split(",") if f]
+
+    # --- DEMO режим: любые demo-* станции
+    if station_id.startswith("demo-"):
+        now = datetime.utcnow()
+        ts_list = [(now - timedelta(minutes=m)).isoformat() + "Z" for m in range(minutes, -1, -1)]
+
+        import math, random
+        series = {f: [] for f in flds}
+        for i in range(len(ts_list)):
+            t = i / 10.0
+            if "Sa0" in series:  # м/с
+                series["Sa0"].append(round(3.0 + 2.0 * math.sin(t) + 0.5 * random.random(), 2))
+            if "Ta1" in series:  # °C
+                base = 18.0 + 4.0 * math.sin(t / 3.0)
+                series["Ta1"].append(round(base + 0.2 * random.random(), 2))
+            if "Hr1" in series:  # %
+                series["Hr1"].append(round(50 + 20 * math.sin(t / 2.0), 1))
+            if "Pa2" in series:  # гПа/гектапаскаль
+                series["Pa2"].append(round(1013 + 3 * math.sin(t / 5.0), 1))
+
+        return {"ts": ts_list, "series": series}
+
+    # --- Обычный режим с БД (если есть)
+    q = sqltext("""
+        select ts, parsed from measurements
+        where station_id = :sid and ts >= now() - (:mins || ' minutes')::interval
+        order by ts asc
+    """)
+    ts_out = []
+    series = {f: [] for f in flds}
+    try:
+        with engine.begin() as conn:
+            for ts, parsed in conn.execute(q, {"sid": station_id, "mins": minutes}):
+                ts_out.append(ts.isoformat())
+                p = parsed or {}
+                for f in flds:
+                    v = p.get(f)
+                    if isinstance(v, list) and v:
+                        series[f].append(v[0] if isinstance(v[0], (int, float)) else None)
+                    elif isinstance(v, (int, float)):
+                        series[f].append(v)
+                    else:
+                        series[f].append(None)
+    except SQLAlchemyError:
+        # если БД недоступна — вернём пустую серию
+        pass
+    return {"ts": ts_out, "series": series}
+
+# -----------------------------------------------------------------------------
+# Корректное монтирование статических файлов (АБСОЛЮТНЫЕ пути)
+# -----------------------------------------------------------------------------
+from pathlib import Path
+
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="root")
+
+# (необязательно) явный обработчик корня, если хочется прямого контроля:
+@app.get("/", include_in_schema=False)
+async def root_index():
+    return FileResponse(STATIC_DIR / "index.html")
+
